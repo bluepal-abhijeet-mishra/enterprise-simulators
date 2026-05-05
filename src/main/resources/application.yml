@@ -10,3 +10,13 @@ spring:
 app:
   simulator:
     topic: shipment-events
+
+simulator:
+  logistics:
+    anomaly-rates:
+      temperature: 0.05
+      route-deviation: 0.02
+    delays-ms:
+      loading: 15000
+      driving: 30000
+      unloading: 20000

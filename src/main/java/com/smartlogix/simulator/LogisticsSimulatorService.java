@@ -1,5 +1,7 @@
 package com.smartlogix.simulator;
 
+import lombok.AllArgsConstructor;
+import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
@@ -24,15 +26,33 @@ public class LogisticsSimulatorService {
     private final KafkaTemplate<String, ShipmentEvent> kafkaTemplate;
     private final String topicName;
 
+    @Value("${simulator.logistics.anomaly-rates.temperature:0.05}")
+    private double tempAnomalyRate;
+
+    @Value("${simulator.logistics.anomaly-rates.route-deviation:0.02}")
+    private double routeAnomalyRate;
+
+    @Value("${simulator.logistics.delays-ms.loading:15000}")
+    private long loadingDelayMs;
+
+    @Value("${simulator.logistics.delays-ms.driving:30000}")
+    private long drivingDelayMs;
+
+    @Value("${simulator.logistics.delays-ms.unloading:20000}")
+    private long unloadingDelayMs;
+
     // Track active shipments. Thread-safe map for scheduler access.
-    // Key: Shipment ID, Value: Current ShipmentEvent state
-    private final Map<String, ShipmentEvent> activeShipments = new ConcurrentHashMap<>();
+    // Key: Shipment ID, Value: ShipmentContext (Event + state entered timestamp)
+    private final Map<String, ShipmentContext> activeShipments = new ConcurrentHashMap<>();
 
     // Valid lifecycle states
     private static final String STATE_CREATED = "shipment_created";
     private static final String STATE_DEPARTED = "vehicle_departed";
     private static final String STATE_ARRIVED = "warehouse_arrived";
     private static final String STATE_COMPLETED = "delivery_completed";
+
+    // Warehouse specific event
+    private static final String EVENT_BARCODE_SCANNED = "barcode_scanned";
 
     // Anomalies
     private static final String ANOMALY_ROUTE_DEVIATION = "route_deviation";
@@ -70,16 +90,17 @@ public class LogisticsSimulatorService {
             double startLat = 37.7749 + (ThreadLocalRandom.current().nextDouble() * 5 - 2.5); // Around SF
             double startLng = -122.4194 + (ThreadLocalRandom.current().nextDouble() * 5 - 2.5);
 
+            long now = System.currentTimeMillis();
             ShipmentEvent newShipment = ShipmentEvent.builder()
                     .shipmentId(shipmentId)
                     .eventType(STATE_CREATED)
                     .vehicleId(vehicleId)
                     .currentLat(startLat)
                     .currentLng(startLng)
-                    .timestamp(System.currentTimeMillis())
+                    .timestamp(now)
                     .build();
 
-            activeShipments.put(shipmentId, newShipment);
+            activeShipments.put(shipmentId, new ShipmentContext(newShipment, now));
             publishEvent(newShipment);
             log.info("Started new shipment: {}", shipmentId);
         }
@@ -89,51 +110,58 @@ public class LogisticsSimulatorService {
      * Iterate over active shipments and process state transitions, GPS drift, and anomalies.
      */
     private void processActiveShipments() {
-        Iterator<Map.Entry<String, ShipmentEvent>> iterator = activeShipments.entrySet().iterator();
+        long now = System.currentTimeMillis();
+        Iterator<Map.Entry<String, ShipmentContext>> iterator = activeShipments.entrySet().iterator();
 
         while (iterator.hasNext()) {
-            Map.Entry<String, ShipmentEvent> entry = iterator.next();
-            ShipmentEvent currentEvent = entry.getValue();
+            Map.Entry<String, ShipmentContext> entry = iterator.next();
+            ShipmentContext context = entry.getValue();
+            ShipmentEvent currentEvent = context.getEvent();
 
             // Clone the event to modify it for the next state
             ShipmentEvent nextEvent = cloneEvent(currentEvent);
-            nextEvent.setTimestamp(System.currentTimeMillis());
+            nextEvent.setTimestamp(now);
 
             boolean stateChanged = false;
             boolean eventEmitted = false;
+            long timeInState = now - context.getStateEnteredTimestamp();
 
             switch (currentEvent.getEventType()) {
                 case STATE_CREATED:
-                    // 30% chance to depart on each tick
-                    if (ThreadLocalRandom.current().nextDouble() < 0.30) {
+                    if (timeInState >= loadingDelayMs) {
                         nextEvent.setEventType(STATE_DEPARTED);
                         stateChanged = true;
                     }
                     break;
 
                 case STATE_DEPARTED:
-                    // Drift GPS
                     driftGps(nextEvent);
 
-                    // 5% chance to inject an anomaly mid-journey
-                    if (ThreadLocalRandom.current().nextDouble() < 0.05) {
-                        injectAnomaly(nextEvent);
-                        eventEmitted = true; // Anomaly was emitted
-                        // Revert GPS if anomaly changed it wildly, or keep it.
-                        // Let's reset the event type back to departed for the map storage
-                        // The anomaly event was sent, but the shipment is STILL departed.
+                    double anomalyRand = ThreadLocalRandom.current().nextDouble();
+                    if (anomalyRand < tempAnomalyRate) {
+                        injectAnomaly(nextEvent, ANOMALY_TEMP_CHANGE);
+                        eventEmitted = true;
+                    } else if (anomalyRand < tempAnomalyRate + routeAnomalyRate) {
+                        injectAnomaly(nextEvent, ANOMALY_ROUTE_DEVIATION);
+                        eventEmitted = true;
                     }
 
-                    // 10% chance to arrive at warehouse (if no anomaly was processed to keep logic simple)
-                    if (!eventEmitted && ThreadLocalRandom.current().nextDouble() < 0.10) {
+                    if (!eventEmitted && timeInState >= drivingDelayMs) {
                         nextEvent.setEventType(STATE_ARRIVED);
                         stateChanged = true;
                     }
                     break;
 
                 case STATE_ARRIVED:
-                    // 40% chance to complete delivery
-                    if (ThreadLocalRandom.current().nextDouble() < 0.40) {
+                    // 10% probability to emit a barcode scan event while in the warehouse
+                    if (ThreadLocalRandom.current().nextDouble() < 0.10) {
+                        ShipmentEvent scanEvent = cloneEvent(nextEvent);
+                        scanEvent.setEventType(EVENT_BARCODE_SCANNED);
+                        publishEvent(scanEvent);
+                        log.info("Barcode scanned for shipment: {}", scanEvent.getShipmentId());
+                    }
+
+                    if (timeInState >= unloadingDelayMs) {
                         nextEvent.setEventType(STATE_COMPLETED);
                         stateChanged = true;
                     }
@@ -145,19 +173,17 @@ public class LogisticsSimulatorService {
                     continue;
             }
 
-            // Update map and publish if state changed
             if (stateChanged) {
-                // If we reached completed state, remove from map
                 if (STATE_COMPLETED.equals(nextEvent.getEventType())) {
                     iterator.remove();
                     log.info("Shipment completed: {}", nextEvent.getShipmentId());
                 } else {
-                    activeShipments.put(nextEvent.getShipmentId(), nextEvent);
+                    context.setEvent(nextEvent);
+                    context.setStateEnteredTimestamp(now);
                 }
                 publishEvent(nextEvent);
             } else if (!eventEmitted && STATE_DEPARTED.equals(currentEvent.getEventType())) {
-                 // Always emit GPS updates when departed, even if state didn't change
-                 activeShipments.put(nextEvent.getShipmentId(), nextEvent);
+                 context.setEvent(nextEvent);
                  publishEvent(nextEvent);
             }
         }
@@ -178,21 +204,18 @@ public class LogisticsSimulatorService {
     /**
      * Injects an anomaly event.
      */
-    private void injectAnomaly(ShipmentEvent baseEvent) {
+    private void injectAnomaly(ShipmentEvent baseEvent, String anomalyType) {
         ShipmentEvent anomalyEvent = cloneEvent(baseEvent);
         anomalyEvent.setTimestamp(System.currentTimeMillis());
+        anomalyEvent.setEventType(anomalyType);
 
-        if (ThreadLocalRandom.current().nextBoolean()) {
-            anomalyEvent.setEventType(ANOMALY_ROUTE_DEVIATION);
+        if (ANOMALY_ROUTE_DEVIATION.equals(anomalyType)) {
             // Sudden spike in GPS
             anomalyEvent.setCurrentLat(anomalyEvent.getCurrentLat() + 0.5); // Big jump
             anomalyEvent.setCurrentLng(anomalyEvent.getCurrentLng() + 0.5);
-            log.warn("Anomaly injected: {} for shipment {}", ANOMALY_ROUTE_DEVIATION, anomalyEvent.getShipmentId());
-        } else {
-            anomalyEvent.setEventType(ANOMALY_TEMP_CHANGE);
-            log.warn("Anomaly injected: {} for shipment {}", ANOMALY_TEMP_CHANGE, anomalyEvent.getShipmentId());
         }
 
+        log.warn("Anomaly injected: {} for shipment {}", anomalyType, anomalyEvent.getShipmentId());
         publishEvent(anomalyEvent);
     }
 
@@ -223,5 +246,12 @@ public class LogisticsSimulatorService {
                     log.error("Unable to send message=[{}] due to : {}", event.getEventType(), ex.getMessage());
                 }
             });
+    }
+
+    @Data
+    @AllArgsConstructor
+    private static class ShipmentContext {
+        private ShipmentEvent event;
+        private long stateEnteredTimestamp;
     }
 }
