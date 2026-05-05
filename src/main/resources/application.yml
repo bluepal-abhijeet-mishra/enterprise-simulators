@@ -9,14 +9,27 @@ spring:
 
 app:
   simulator:
-    topic: shipment-events
+    topics:
+      shipment-events: shipment-events
+      vehicle-telemetry: vehicle-telemetry
+      warehouse-events: warehouse-events
+      alerts: alerts
+      analytics-metrics: analytics-metrics
 
 simulator:
   logistics:
+    tick-rate-ms: 5000
+    new-shipment-probability: 0.20
+    alert-simulation-enabled: true
+    analytics-simulation-enabled: true
     anomaly-rates:
       temperature: 0.05
       route-deviation: 0.02
+      unauthorized-stop: 0.01
     delays-ms:
       loading: 15000
       driving: 30000
       unloading: 20000
+    cold-chain:
+      min-temperature-celsius: 2.0
+      max-temperature-celsius: 8.0

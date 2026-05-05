@@ -34,6 +34,21 @@ public class ShipmentEvent {
     private String vehicleId;
 
     /**
+     * Driver assigned to this shipment.
+     */
+    private String driverId;
+
+    /**
+     * Origin warehouse identifier.
+     */
+    private String originWarehouseId;
+
+    /**
+     * Destination warehouse identifier.
+     */
+    private String destinationWarehouseId;
+
+    /**
      * Current latitude of the shipment/vehicle.
      */
     private double currentLat;
@@ -42,6 +57,26 @@ public class ShipmentEvent {
      * Current longitude of the shipment/vehicle.
      */
     private double currentLng;
+
+    /**
+     * Planned delivery ETA in epoch milliseconds.
+     */
+    private long plannedEta;
+
+    /**
+     * Current measured temperature for cold-chain shipments.
+     */
+    private double temperatureCelsius;
+
+    /**
+     * Simulator-computed delay risk score from 0.0 to 1.0.
+     */
+    private double delayRiskScore;
+
+    /**
+     * Optional human-readable anomaly reason for downstream alert/fraud testing.
+     */
+    private String anomalyReason;
 
     /**
      * Epoch milliseconds representing when this event occurred.
