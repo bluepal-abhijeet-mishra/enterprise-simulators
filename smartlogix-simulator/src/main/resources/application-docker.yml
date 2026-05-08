@@ -1,0 +1,9 @@
+spring:
+  kafka:
+    bootstrap-servers: kafka:29092
+
+simulator:
+  logistics:
+    tick-rate-ms: 2000
+    new-shipment-probability: 0.50
+    max-active-shipments: 1000

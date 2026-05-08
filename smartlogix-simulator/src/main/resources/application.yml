@@ -1,4 +1,8 @@
 spring:
+  application:
+    name: smartlogix-simulator
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
   kafka:
     bootstrap-servers: localhost:9092
     producer:
@@ -6,6 +10,9 @@ spring:
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
       properties:
         spring.json.add.type.headers: false
+
+server:
+  shutdown: graceful
 
 app:
   simulator:
@@ -20,6 +27,7 @@ simulator:
   logistics:
     tick-rate-ms: 5000
     new-shipment-probability: 0.20
+    max-active-shipments: 250
     alert-simulation-enabled: true
     analytics-simulation-enabled: true
     anomaly-rates:
@@ -33,3 +41,28 @@ simulator:
     cold-chain:
       min-temperature-celsius: 2.0
       max-temperature-celsius: 8.0
+    warehouse:
+      congestion-queue-threshold: 25
+      barcode-scan-probability: 0.30
+      bay-assignment-probability: 0.65
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: smartlogix-simulator
+
+logging:
+  level:
+    com.smartlogix.simulator: INFO
+    org.apache.kafka.clients.admin.AdminClientConfig: WARN
+    org.apache.kafka.clients.producer.ProducerConfig: WARN
+    org.apache.kafka.clients.Metadata: WARN
+    org.apache.kafka.common.metrics.Metrics: WARN
+    org.apache.kafka.common.utils.AppInfoParser: WARN

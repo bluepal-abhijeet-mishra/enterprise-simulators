@@ -1,0 +1,17 @@
+simulator:
+  logistics:
+    tick-rate-ms: 500
+    new-shipment-probability: 0.95
+    max-active-shipments: 5000
+    anomaly-rates:
+      temperature: 0.03
+      route-deviation: 0.02
+      unauthorized-stop: 0.01
+    delays-ms:
+      loading: 3000
+      driving: 8000
+      unloading: 3000
+
+logging:
+  level:
+    com.smartlogix.simulator.LogisticsSimulatorService: WARN

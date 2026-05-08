@@ -1,7 +1,6 @@
 package com.smartlogix.simulator;
 
 import org.apache.kafka.clients.admin.NewTopic;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.TopicBuilder;
@@ -12,24 +11,15 @@ import org.springframework.kafka.config.TopicBuilder;
 @Configuration
 public class KafkaTopicConfig {
 
-    @Value("${app.simulator.topics.shipment-events:shipment-events}")
-    private String shipmentEventsTopic;
+    private final SimulatorTopicsProperties topics;
 
-    @Value("${app.simulator.topics.vehicle-telemetry:vehicle-telemetry}")
-    private String vehicleTelemetryTopic;
-
-    @Value("${app.simulator.topics.warehouse-events:warehouse-events}")
-    private String warehouseEventsTopic;
-
-    @Value("${app.simulator.topics.alerts:alerts}")
-    private String alertsTopic;
-
-    @Value("${app.simulator.topics.analytics-metrics:analytics-metrics}")
-    private String analyticsMetricsTopic;
+    public KafkaTopicConfig(SimulatorTopicsProperties topics) {
+        this.topics = topics;
+    }
 
     @Bean
     public NewTopic shipmentEventsTopic() {
-        return TopicBuilder.name(shipmentEventsTopic)
+        return TopicBuilder.name(topics.getShipmentEvents())
                 .partitions(12)
                 .replicas(1)
                 .config("retention.ms", String.valueOf(days(7)))
@@ -38,7 +28,7 @@ public class KafkaTopicConfig {
 
     @Bean
     public NewTopic vehicleTelemetryTopic() {
-        return TopicBuilder.name(vehicleTelemetryTopic)
+        return TopicBuilder.name(topics.getVehicleTelemetry())
                 .partitions(12)
                 .replicas(1)
                 .config("retention.ms", String.valueOf(days(3)))
@@ -47,7 +37,7 @@ public class KafkaTopicConfig {
 
     @Bean
     public NewTopic warehouseEventsTopic() {
-        return TopicBuilder.name(warehouseEventsTopic)
+        return TopicBuilder.name(topics.getWarehouseEvents())
                 .partitions(6)
                 .replicas(1)
                 .config("retention.ms", String.valueOf(days(7)))
@@ -56,7 +46,7 @@ public class KafkaTopicConfig {
 
     @Bean
     public NewTopic alertsTopic() {
-        return TopicBuilder.name(alertsTopic)
+        return TopicBuilder.name(topics.getAlerts())
                 .partitions(6)
                 .replicas(1)
                 .config("retention.ms", String.valueOf(days(30)))
@@ -65,7 +55,7 @@ public class KafkaTopicConfig {
 
     @Bean
     public NewTopic analyticsMetricsTopic() {
-        return TopicBuilder.name(analyticsMetricsTopic)
+        return TopicBuilder.name(topics.getAnalyticsMetrics())
                 .partitions(4)
                 .replicas(1)
                 .config("retention.ms", String.valueOf(days(90)))

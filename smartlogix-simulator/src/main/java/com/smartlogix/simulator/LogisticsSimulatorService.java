@@ -3,7 +3,7 @@ package com.smartlogix.simulator;
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
+import jakarta.annotation.PreDestroy;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -51,65 +51,27 @@ public class LogisticsSimulatorService {
     };
 
     private final KafkaTemplate<String, Object> kafkaTemplate;
-    private final String shipmentEventsTopic;
-    private final String vehicleTelemetryTopic;
-    private final String warehouseEventsTopic;
-    private final String alertsTopic;
-    private final String analyticsMetricsTopic;
+    private final SimulatorProperties properties;
+    private final SimulatorTopicsProperties topics;
+    private final SimulatorMetrics metrics;
 
     private final Map<String, ShipmentContext> activeShipments = new ConcurrentHashMap<>();
     private final Map<String, WarehouseRuntime> warehouseRuntime = new ConcurrentHashMap<>();
 
-    @Value("${simulator.logistics.new-shipment-probability:0.20}")
-    private double newShipmentProbability;
-
-    @Value("${simulator.logistics.alert-simulation-enabled:true}")
-    private boolean alertSimulationEnabled;
-
-    @Value("${simulator.logistics.analytics-simulation-enabled:true}")
-    private boolean analyticsSimulationEnabled;
-
-    @Value("${simulator.logistics.anomaly-rates.temperature:0.05}")
-    private double tempAnomalyRate;
-
-    @Value("${simulator.logistics.anomaly-rates.route-deviation:0.02}")
-    private double routeAnomalyRate;
-
-    @Value("${simulator.logistics.anomaly-rates.unauthorized-stop:0.01}")
-    private double unauthorizedStopRate;
-
-    @Value("${simulator.logistics.delays-ms.loading:15000}")
-    private long loadingDelayMs;
-
-    @Value("${simulator.logistics.delays-ms.driving:30000}")
-    private long drivingDelayMs;
-
-    @Value("${simulator.logistics.delays-ms.unloading:20000}")
-    private long unloadingDelayMs;
-
-    @Value("${simulator.logistics.cold-chain.min-temperature-celsius:2.0}")
-    private double minColdChainTemp;
-
-    @Value("${simulator.logistics.cold-chain.max-temperature-celsius:8.0}")
-    private double maxColdChainTemp;
-
     public LogisticsSimulatorService(
             KafkaTemplate<String, Object> kafkaTemplate,
-            @Value("${app.simulator.topics.shipment-events:shipment-events}") String shipmentEventsTopic,
-            @Value("${app.simulator.topics.vehicle-telemetry:vehicle-telemetry}") String vehicleTelemetryTopic,
-            @Value("${app.simulator.topics.warehouse-events:warehouse-events}") String warehouseEventsTopic,
-            @Value("${app.simulator.topics.alerts:alerts}") String alertsTopic,
-            @Value("${app.simulator.topics.analytics-metrics:analytics-metrics}") String analyticsMetricsTopic) {
+            SimulatorProperties properties,
+            SimulatorTopicsProperties topics,
+            SimulatorMetrics metrics) {
         this.kafkaTemplate = kafkaTemplate;
-        this.shipmentEventsTopic = shipmentEventsTopic;
-        this.vehicleTelemetryTopic = vehicleTelemetryTopic;
-        this.warehouseEventsTopic = warehouseEventsTopic;
-        this.alertsTopic = alertsTopic;
-        this.analyticsMetricsTopic = analyticsMetricsTopic;
+        this.properties = properties;
+        this.topics = topics;
+        this.metrics = metrics;
 
         for (WarehouseProfile warehouse : WAREHOUSES) {
             warehouseRuntime.put(warehouse.id(), new WarehouseRuntime(warehouse.capacity() / 3, 0));
         }
+        metrics.setActiveShipments(activeShipments.size());
     }
 
     /**
@@ -121,10 +83,23 @@ public class LogisticsSimulatorService {
         tryAddNewShipment(now);
         processActiveShipments(now);
         emitWarehouseMetrics(now);
+        metrics.setActiveShipments(activeShipments.size());
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        log.info("Stopping SmartLogix simulator with {} active shipments; flushing Kafka producer", activeShipments.size());
+        kafkaTemplate.flush();
     }
 
     private void tryAddNewShipment(long now) {
-        if (ThreadLocalRandom.current().nextDouble() >= newShipmentProbability) {
+        if (activeShipments.size() >= properties.getMaxActiveShipments()) {
+            log.debug("Skipping new shipment because active shipment limit {} is reached",
+                    properties.getMaxActiveShipments());
+            return;
+        }
+
+        if (ThreadLocalRandom.current().nextDouble() >= properties.getNewShipmentProbability()) {
             return;
         }
 
@@ -133,8 +108,13 @@ public class LogisticsSimulatorService {
         String shipmentId = "SHP-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
         String vehicleId = "TRK-" + ThreadLocalRandom.current().nextInt(1000, 9999);
         String driverId = "DRV-" + ThreadLocalRandom.current().nextInt(10000, 99999);
-        long plannedEta = now + loadingDelayMs + drivingDelayMs + unloadingDelayMs + ThreadLocalRandom.current().nextLong(60000, 180000);
-        double temperature = ThreadLocalRandom.current().nextDouble(minColdChainTemp, maxColdChainTemp);
+        long plannedEta = now + properties.getDelaysMs().getLoading()
+                + properties.getDelaysMs().getDriving()
+                + properties.getDelaysMs().getUnloading()
+                + ThreadLocalRandom.current().nextLong(60000, 180000);
+        double temperature = ThreadLocalRandom.current().nextDouble(
+                properties.getColdChain().getMinTemperatureCelsius(),
+                properties.getColdChain().getMaxTemperatureCelsius());
 
         ShipmentEvent created = ShipmentEvent.builder()
                 .shipmentId(shipmentId)
@@ -154,8 +134,9 @@ public class LogisticsSimulatorService {
         ShipmentContext context = new ShipmentContext(created, now, origin, destination, 0.0, false, false, 0);
         activeShipments.put(shipmentId, context);
         incrementWarehouseLoad(origin.id(), 1);
+        metrics.setActiveShipments(activeShipments.size());
 
-        publish(shipmentEventsTopic, shipmentId, created);
+        publish(topics.getShipmentEvents(), shipmentId, created);
         publishWarehouseEvent(origin.id(), shipmentId, vehicleId, EVENT_BARCODE_SCANNED, now);
         log.info("Started shipment {} from {} to {}", shipmentId, origin.id(), destination.id());
     }
@@ -175,7 +156,7 @@ public class LogisticsSimulatorService {
             switch (current.getEventType()) {
                 case STATE_CREATED:
                     emitLoadingTelemetry(context, now);
-                    if (timeInState >= loadingDelayMs) {
+                    if (timeInState >= properties.getDelaysMs().getLoading()) {
                         transition(context, next, STATE_DEPARTED, now);
                         publishWarehouseEvent(current.getOriginWarehouseId(), current.getShipmentId(),
                                 current.getVehicleId(), EVENT_LOADING_COMPLETED, now);
@@ -188,7 +169,7 @@ public class LogisticsSimulatorService {
 
                 case STATE_ARRIVED:
                     emitWarehouseDwellEvents(context, now);
-                    if (timeInState >= unloadingDelayMs) {
+                    if (timeInState >= properties.getDelaysMs().getUnloading()) {
                         transition(context, next, STATE_COMPLETED, now);
                         publishWarehouseEvent(current.getDestinationWarehouseId(), current.getShipmentId(),
                                 current.getVehicleId(), EVENT_UNLOADING_COMPLETED, now);
@@ -229,7 +210,7 @@ public class LogisticsSimulatorService {
 
         maybeInjectAnomaly(context, next, now);
 
-        if (timeInState >= drivingDelayMs || context.getRouteProgress() >= 1.0) {
+        if (timeInState >= properties.getDelaysMs().getDriving() || context.getRouteProgress() >= 1.0) {
             next.setCurrentLat(context.getDestination().lat());
             next.setCurrentLng(context.getDestination().lng());
             transition(context, next, STATE_ARRIVED, now);
@@ -239,13 +220,13 @@ public class LogisticsSimulatorService {
             publishWarehouseEvent(context.getDestination().id(), next.getShipmentId(), next.getVehicleId(),
                     EVENT_BAY_ASSIGNED, now);
         } else {
-            publish(shipmentEventsTopic, next.getShipmentId(), next);
+            publish(topics.getShipmentEvents(), next.getShipmentId(), next);
         }
     }
 
     private void emitWarehouseDwellEvents(ShipmentContext context, long now) {
         ShipmentEvent event = context.getEvent();
-        if (ThreadLocalRandom.current().nextDouble() < 0.30) {
+        if (ThreadLocalRandom.current().nextDouble() < properties.getWarehouse().getBarcodeScanProbability()) {
             publishWarehouseEvent(event.getDestinationWarehouseId(), event.getShipmentId(), event.getVehicleId(),
                     EVENT_BARCODE_SCANNED, now);
         }
@@ -254,25 +235,27 @@ public class LogisticsSimulatorService {
 
     private void maybeInjectAnomaly(ShipmentContext context, ShipmentEvent baseEvent, long now) {
         double anomalyRand = ThreadLocalRandom.current().nextDouble();
+        SimulatorProperties.AnomalyRates anomalyRates = properties.getAnomalyRates();
 
-        if (anomalyRand < tempAnomalyRate) {
+        if (anomalyRand < anomalyRates.getTemperature()) {
             ShipmentEvent anomaly = cloneEvent(baseEvent);
             anomaly.setEventType(ANOMALY_TEMP_CHANGE);
-            anomaly.setTemperatureCelsius(maxColdChainTemp + ThreadLocalRandom.current().nextDouble(3.0, 9.0));
+            anomaly.setTemperatureCelsius(properties.getColdChain().getMaxTemperatureCelsius()
+                    + ThreadLocalRandom.current().nextDouble(3.0, 9.0));
             anomaly.setAnomalyReason("Cold-chain reading outside configured temperature band");
-            publish(shipmentEventsTopic, anomaly.getShipmentId(), anomaly);
+            publish(topics.getShipmentEvents(), anomaly.getShipmentId(), anomaly);
             publishAlert("COLD_CHAIN_VIOLATION", "CRITICAL", anomaly, null, anomaly.getAnomalyReason(), now);
             return;
         }
 
-        if (anomalyRand < tempAnomalyRate + routeAnomalyRate) {
+        if (anomalyRand < anomalyRates.getTemperature() + anomalyRates.getRouteDeviation()) {
             ShipmentEvent anomaly = cloneEvent(baseEvent);
             anomaly.setEventType(ANOMALY_ROUTE_DEVIATION);
             anomaly.setCurrentLat(anomaly.getCurrentLat() + ThreadLocalRandom.current().nextDouble(0.20, 0.55));
             anomaly.setCurrentLng(anomaly.getCurrentLng() + ThreadLocalRandom.current().nextDouble(0.20, 0.55));
             anomaly.setAnomalyReason("GPS coordinates deviated more than 500m from planned route");
             context.setRouteDeviationCount(context.getRouteDeviationCount() + 1);
-            publish(shipmentEventsTopic, anomaly.getShipmentId(), anomaly);
+            publish(topics.getShipmentEvents(), anomaly.getShipmentId(), anomaly);
             publishAlert("ROUTE_DEVIATION", "HIGH", anomaly, null, anomaly.getAnomalyReason(), now);
 
             if (context.getRouteDeviationCount() > 3) {
@@ -282,12 +265,13 @@ public class LogisticsSimulatorService {
             return;
         }
 
-        if (anomalyRand < tempAnomalyRate + routeAnomalyRate + unauthorizedStopRate) {
+        if (anomalyRand < anomalyRates.getTemperature() + anomalyRates.getRouteDeviation()
+                + anomalyRates.getUnauthorizedStop()) {
             ShipmentEvent anomaly = cloneEvent(baseEvent);
             anomaly.setEventType(ANOMALY_UNAUTHORIZED_STOP);
             anomaly.setAnomalyReason("Vehicle idle outside warehouse or depot");
             context.setUnauthorizedStopActive(true);
-            publish(shipmentEventsTopic, anomaly.getShipmentId(), anomaly);
+            publish(topics.getShipmentEvents(), anomaly.getShipmentId(), anomaly);
             publishVehicleTelemetry(context, EVENT_IDLE_STARTED, 0.0, true, false, null, now);
             publishAlert("UNAUTHORIZED_STOP", "HIGH", anomaly, null, anomaly.getAnomalyReason(), now);
         } else if (context.isUnauthorizedStopActive()) {
@@ -305,10 +289,10 @@ public class LogisticsSimulatorService {
 
             publishWarehouseEvent(entry.getKey(), null, null, EVENT_QUEUE_DEPTH_CHANGED, now);
 
-            if (analyticsSimulationEnabled) {
+            if (properties.isAnalyticsSimulationEnabled()) {
                 Map<String, String> tags = new HashMap<>();
                 tags.put("warehouse_id", entry.getKey());
-                publish(analyticsMetricsTopic, "warehouse_load", AnalyticsMetricEvent.builder()
+                publish(topics.getAnalyticsMetrics(), "warehouse_load", AnalyticsMetricEvent.builder()
                         .metricType("warehouse_load")
                         .entityId(entry.getKey())
                         .value(runtime.getCurrentLoad())
@@ -318,7 +302,7 @@ public class LogisticsSimulatorService {
                         .build());
             }
 
-            if (runtime.getQueueDepth() > 25) {
+            if (runtime.getQueueDepth() > properties.getWarehouse().getCongestionQueueThreshold()) {
                 publishAlert("WAREHOUSE_CONGESTION", "MEDIUM", null, entry.getKey(),
                         "Warehouse queue depth exceeded simulator threshold", now);
             }
@@ -331,13 +315,13 @@ public class LogisticsSimulatorService {
         event.setAnomalyReason(null);
         context.setEvent(event);
         context.setStateEnteredTimestamp(now);
-        publish(shipmentEventsTopic, event.getShipmentId(), event);
+        publish(topics.getShipmentEvents(), event.getShipmentId(), event);
     }
 
     private void publishVehicleTelemetry(ShipmentContext context, String eventType, double speed, boolean idle,
                                          boolean atWarehouse, String nearestWarehouseId, long now) {
         ShipmentEvent event = context.getEvent();
-        publish(vehicleTelemetryTopic, event.getVehicleId(), VehicleTelemetryEvent.builder()
+        publish(topics.getVehicleTelemetry(), event.getVehicleId(), VehicleTelemetryEvent.builder()
                 .vehicleId(event.getVehicleId())
                 .shipmentId(event.getShipmentId())
                 .driverId(event.getDriverId())
@@ -360,11 +344,11 @@ public class LogisticsSimulatorService {
         }
 
         WarehouseProfile profile = warehouseById(warehouseId);
-        String bayId = ThreadLocalRandom.current().nextDouble() < 0.65
+        String bayId = ThreadLocalRandom.current().nextDouble() < properties.getWarehouse().getBayAssignmentProbability()
                 ? "BAY-" + ThreadLocalRandom.current().nextInt(1, 24)
                 : null;
 
-        publish(warehouseEventsTopic, warehouseId, WarehouseEvent.builder()
+        publish(topics.getWarehouseEvents(), warehouseId, WarehouseEvent.builder()
                 .warehouseId(warehouseId)
                 .shipmentId(shipmentId)
                 .vehicleId(vehicleId)
@@ -379,11 +363,11 @@ public class LogisticsSimulatorService {
 
     private void publishAlert(String type, String severity, ShipmentEvent shipmentEvent, String warehouseId,
                               String message, long now) {
-        if (!alertSimulationEnabled) {
+        if (!properties.isAlertSimulationEnabled()) {
             return;
         }
 
-        publish(alertsTopic, type, AlertSimulationEvent.builder()
+        publish(topics.getAlerts(), type, AlertSimulationEvent.builder()
                 .alertId("ALT-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase())
                 .alertType(type)
                 .severity(severity)
@@ -399,8 +383,10 @@ public class LogisticsSimulatorService {
         kafkaTemplate.send(topic, key, event)
                 .whenComplete((result, ex) -> {
                     if (ex == null) {
+                        metrics.recordSent(topic);
                         log.debug("Sent topic={} key={} offset={}", topic, key, result.getRecordMetadata().offset());
                     } else {
+                        metrics.recordFailed(topic);
                         log.error("Unable to send topic={} key={} because {}", topic, key, ex.getMessage());
                     }
                 });
@@ -423,7 +409,8 @@ public class LogisticsSimulatorService {
 
     private double normalTemperature(double current) {
         double next = current + ThreadLocalRandom.current().nextDouble(-0.35, 0.35);
-        return Math.max(minColdChainTemp, Math.min(maxColdChainTemp, next));
+        return Math.max(properties.getColdChain().getMinTemperatureCelsius(),
+                Math.min(properties.getColdChain().getMaxTemperatureCelsius(), next));
     }
 
     private void incrementWarehouseLoad(String warehouseId, int delta) {
