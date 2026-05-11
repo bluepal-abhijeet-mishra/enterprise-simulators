@@ -1,20 +1,20 @@
 # SmartLogix Simulator Integration Handoff
 
-Document version: v1.1  
+Document version: v1.2  
 Service: `smartlogix-simulator`  
 Owner: Simulator team  
-Purpose: PRD Phase 1 Kafka event generator  
+Purpose: PRD Phase 1 Kafka event generator and stateful mock shipment simulator  
 Runtime: Java 17, Spring Boot 3.2.x, Apache Kafka
 
 ## Executive Summary
 
-The SmartLogix simulator is a producer-only Spring Boot service that generates realistic logistics events for the SmartLogix real-time monitoring platform.
+The SmartLogix simulator is a Spring Boot Kafka service that generates realistic logistics events for the SmartLogix real-time monitoring platform.
 
 It is designed to help backend, data engineering, alerting, fraud detection, QA, and dashboard teams build and test their services before real IoT, warehouse, driver, and shipment integrations are available.
 
-The simulator publishes JSON messages to the PRD-defined Kafka topics. Downstream services must consume those topics and implement persistence, ETL, analytics APIs, alerting, fraud detection, and dashboard workflows.
+The simulator publishes JSON messages to the PRD-defined Kafka topics. It also consumes dynamic shipment simulation commands from `simulator-commands`, so downstream teams can inject a real user-created `shipmentId` into the simulator state machine and receive realistic lifecycle events for that exact parcel.
 
-This service is intentionally not a backend API service. It does not expose business REST APIs, does not consume Kafka topics, does not write to PostgreSQL, and does not implement RBAC or fraud logic. Its responsibility is reliable, realistic event generation.
+This service is intentionally not a backend API service. It does not expose business REST APIs, does not write to PostgreSQL, and does not implement RBAC or fraud logic. Its responsibility is reliable, realistic event generation plus command-driven shipment injection for integration testing.
 
 ## PRD Alignment
 
@@ -33,6 +33,7 @@ It supports the following PRD areas:
 | Analytics/ETL Integration | Publishes warehouse metric events to `analytics-metrics` |
 | Fraud Detection Integration | Emits route deviation and unauthorized stop events that fraud services can consume |
 | Dashboard Integration | Provides live data streams for maps, alerts, warehouse load, and SLA panels |
+| User-Driven Parcel Flow Testing | Consumes `simulator-commands` and simulates the requested `shipmentId` |
 
 The simulator does not replace the real Alert Engine, Fraud Detection module, ETL jobs, REST APIs, PostgreSQL persistence, ClickHouse/Elasticsearch analytics store, or React dashboard. Those are downstream responsibilities.
 
@@ -44,13 +45,16 @@ smartlogix-simulator
         | Kafka producer
         v
 Apache Kafka
+        ^
+        | Kafka command producer
+Logistics Backend
         |
         | Kafka consumers / Kafka Streams / ETL jobs
         v
 Backend APIs / Alert Engine / Fraud Detection / Data Pipeline / Dashboard
 ```
 
-Downstream projects should not call the simulator directly. They connect to the same Kafka broker and consume the events produced by the simulator.
+Downstream projects should not call the simulator through REST. They connect to the same Kafka broker. Backend services consume simulator events, and the logistics backend may publish shipment simulation commands to `simulator-commands`.
 
 ## Module Location
 
@@ -65,6 +69,7 @@ Important files:
 | File | Purpose |
 | --- | --- |
 | `src/main/java/com/smartlogix/simulator/LogisticsSimulatorService.java` | Main event generation loop |
+| `src/main/java/com/smartlogix/simulator/ShipmentSimulationCommand.java` | Command DTO consumed from `simulator-commands` |
 | `src/main/java/com/smartlogix/simulator/KafkaTopicConfig.java` | PRD topic creation |
 | `src/main/java/com/smartlogix/simulator/SimulatorProperties.java` | Typed and validated simulator configuration |
 | `src/main/java/com/smartlogix/simulator/SimulatorTopicsProperties.java` | Topic name binding |
@@ -100,6 +105,17 @@ By default, every 5 seconds the simulator:
 7. Optionally emits simulated alert events.
 8. Optionally emits analytics metric events.
 9. Updates health and metrics for operational visibility.
+
+Dynamic shipment command flow:
+
+1. Logistics backend creates a parcel from a user action.
+2. Logistics backend publishes a JSON command to Kafka topic `simulator-commands`.
+3. Simulator consumes the command using consumer group `logistics-simulator-group`.
+4. Simulator validates the origin and destination warehouse IDs.
+5. Simulator creates a `shipment_created` event using the exact inbound `shipmentId`.
+6. Simulator inserts that shipment into the same in-memory state machine used by synthetic shipments.
+7. The scheduled tick advances that parcel through `vehicle_departed`, `warehouse_arrived`, and `delivery_completed`.
+8. Downstream consumers receive events for that real user-created `shipmentId` on `shipment-events`.
 
 Shipment lifecycle:
 
@@ -148,7 +164,7 @@ For remote Kafka usage, Kafka must advertise a host/IP reachable by both the sim
 
 ## Kafka Topics
 
-The simulator creates the five PRD topics on startup.
+The simulator creates the five PRD event topics and one command topic on startup.
 
 | Topic | Partitions | Retention | Partition Key | Main Consumers |
 | --- | ---: | --- | --- | --- |
@@ -157,6 +173,7 @@ The simulator creates the five PRD topics on startup.
 | `warehouse-events` | 6 | 7 days | `warehouseId` | Warehouse service, ETL, dashboard analytics |
 | `alerts` | 6 | 30 days | `alertType` | Alert API, dashboard, notification service |
 | `analytics-metrics` | 4 | 90 days | `metricType` | ETL, analytics store loaders, dashboard metrics |
+| `simulator-commands` | 6 | 7 days | `shipmentId` | Simulator command listener |
 
 Partitioning follows the PRD intent:
 
@@ -165,6 +182,7 @@ Partitioning follows the PRD intent:
 - `warehouseId` groups operational activity by warehouse.
 - `alertType` groups alert streams by type.
 - `metricType` groups analytics data by metric family.
+- `shipmentId` on `simulator-commands` keeps command ordering stable per user-created parcel.
 
 ## Event Contract
 
@@ -217,6 +235,111 @@ Consumer recommendations:
 - Use `eventType` to drive status transitions.
 - Use `temperature_change`, `route_deviation`, and `unauthorized_stop` for alert/fraud rules.
 - Treat `timestamp` and `plannedEta` as epoch milliseconds.
+
+### `simulator-commands`
+
+Purpose: command topic used by the logistics backend to inject a user-created parcel into the simulator state machine.
+
+Producer:
+
+```text
+Logistics backend / parcel service
+```
+
+Consumer:
+
+```text
+smartlogix-simulator
+```
+
+Simulator consumer group:
+
+```text
+logistics-simulator-group
+```
+
+Partition key:
+
+```text
+shipmentId
+```
+
+Sample command payload:
+
+```json
+{
+  "shipmentId": "PARCEL-100045",
+  "originWarehouseId": "WH-SEA",
+  "destinationWarehouseId": "WH-LAX"
+}
+```
+
+Required command fields:
+
+| Field | Type | Nullable | Notes |
+| --- | --- | --- | --- |
+| `shipmentId` | string | No | Must be the exact parcel/shipment ID created by the logistics backend |
+| `originWarehouseId` | string | No | Must match a simulator warehouse ID |
+| `destinationWarehouseId` | string | No | Must match a simulator warehouse ID and be different from origin |
+
+Supported warehouse IDs:
+
+```text
+WH-SEA
+WH-SFO
+WH-LAX
+WH-DEN
+WH-CHI
+```
+
+Simulator behavior after consuming the command:
+
+- Generates a realistic `vehicleId`, for example `TRK-4821`.
+- Generates a realistic `driverId`, for example `DRV-18472`.
+- Builds a `shipment_created` event using the exact command `shipmentId`.
+- Inserts the shipment into the active in-memory state machine.
+- Publishes the initial `shipment_created` event to `shipment-events`.
+- Continues publishing lifecycle, vehicle telemetry, warehouse events, and possible anomaly events during later ticks.
+
+Invalid commands:
+
+- Missing `shipmentId` is ignored and logged.
+- Unknown warehouse IDs are ignored and logged.
+- Commands where origin and destination are the same are ignored and logged.
+- The simulator does not write rejection records to a dead-letter topic yet.
+
+Example Spring Kafka producer from the logistics backend:
+
+```java
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Service;
+
+@Service
+public class ShipmentSimulationCommandProducer {
+
+    private final KafkaTemplate<String, Object> kafkaTemplate;
+
+    public ShipmentSimulationCommandProducer(KafkaTemplate<String, Object> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
+    }
+
+    public void requestSimulation(String shipmentId, String originWarehouseId, String destinationWarehouseId) {
+        ShipmentSimulationCommand command = new ShipmentSimulationCommand();
+        command.setShipmentId(shipmentId);
+        command.setOriginWarehouseId(originWarehouseId);
+        command.setDestinationWarehouseId(destinationWarehouseId);
+
+        kafkaTemplate.send("simulator-commands", shipmentId, command);
+    }
+}
+```
+
+Producer-side recommendation:
+
+- Publish the command only after the parcel has been persisted in the logistics backend.
+- Use the same `shipmentId` as the parcel record and Kafka key.
+- Make command production idempotent from the backend perspective; repeated commands for the same `shipmentId` may restart that active simulation.
+- Continue consuming `shipment-events` to update the parcel status shown to users.
 
 ### `vehicle-telemetry`
 
@@ -476,6 +599,7 @@ Consumers may create equivalent DTOs in their own package. Field names must matc
 | Team/Service | Topics To Consume | Expected Implementation |
 | --- | --- | --- |
 | Shipment backend | `shipment-events` | Persist events, maintain shipment status, expose shipment APIs |
+| Logistics backend / Parcel service | Produce to `simulator-commands`; consume `shipment-events` | Inject user-created parcels into simulator and update parcel status from lifecycle events |
 | Vehicle backend | `vehicle-telemetry` | Maintain vehicle location/status, feed live map APIs |
 | Warehouse backend | `warehouse-events` | Maintain warehouse load, queue, scan, and bay state |
 | Alert Engine | `shipment-events`, `vehicle-telemetry`, `warehouse-events` | Evaluate PRD alert rules and produce real alerts |
@@ -551,7 +675,7 @@ mvn spring-boot:run -Dspring-boot.run.profiles=local
 Expected startup log:
 
 ```text
-SmartLogix simulator ready: mode=producer-only
+SmartLogix simulator ready
 Kafka event contract topics: shipmentEvents=shipment-events ...
 Started LogisticsSimulatorApplication
 ```
@@ -605,6 +729,27 @@ smartlogix-simulator/src/main/resources/application.yml
 Key settings:
 
 ```yaml
+spring:
+  kafka:
+    bootstrap-servers: localhost:9092
+    consumer:
+      group-id: logistics-simulator-group
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "*"
+        spring.json.value.default.type: com.smartlogix.simulator.ShipmentSimulationCommand
+
+app:
+  simulator:
+    topics:
+      shipment-events: shipment-events
+      vehicle-telemetry: vehicle-telemetry
+      warehouse-events: warehouse-events
+      alerts: alerts
+      analytics-metrics: analytics-metrics
+      simulator-commands: simulator-commands
+
 simulator:
   logistics:
     tick-rate-ms: 5000
@@ -680,6 +825,19 @@ vehicle-telemetry
 warehouse-events
 alerts
 analytics-metrics
+simulator-commands
+```
+
+Send a dynamic shipment command:
+
+```bash
+kafka-console-producer --bootstrap-server localhost:9092 --topic simulator-commands --property parse.key=true --property key.separator=:
+```
+
+Then enter one line:
+
+```text
+PARCEL-100045:{"shipmentId":"PARCEL-100045","originWarehouseId":"WH-SEA","destinationWarehouseId":"WH-LAX"}
 ```
 
 Consume shipment events:
@@ -712,11 +870,13 @@ Before downstream teams start development:
 
 - Kafka is running and reachable.
 - Simulator starts successfully.
-- The five PRD topics exist.
+- The five PRD event topics and `simulator-commands` exist.
 - Console consumer can read from `shipment-events`.
+- Logistics backend can publish a valid command to `simulator-commands`.
 - Backend project uses the same Kafka bootstrap server.
 - Backend consumer group has a stable `group-id`.
 - DTO field names match the simulator JSON contract.
+- Command payload uses valid simulator warehouse IDs.
 - Consumers treat event timestamps as epoch milliseconds.
 - Consumers use idempotent writes where possible.
 - Alert/fraud teams understand simulated alerts are optional test data, not the final production alert engine.
@@ -726,7 +886,8 @@ Before downstream teams start development:
 Simulator team owns:
 
 - Kafka event generation.
-- Topic creation for the five PRD topics.
+- Kafka listener for `simulator-commands`.
+- Topic creation for the five PRD event topics and the simulator command topic.
 - Simulator configuration and runtime profiles.
 - JSON event contract documentation.
 - Health and metrics for the simulator service.
@@ -734,6 +895,7 @@ Simulator team owns:
 
 Downstream teams own:
 
+- Publishing valid dynamic shipment commands after user-created parcels are persisted.
 - Kafka consumers.
 - Kafka Streams topologies.
 - PostgreSQL writes.
@@ -750,6 +912,7 @@ Downstream teams own:
 
 - Java 17 is the PRD target. The simulator Maven build targets Java 17.
 - This simulator generates realistic synthetic data, not real IoT/driver/warehouse integrations.
+- Dynamic command processing is intended for integration testing user-driven flows. It is not a production carrier orchestration API.
 - Default profile is demo/integration oriented, not a 50K events/min benchmark profile.
 - Load testing requires environment tuning, downstream consumer readiness, and possibly multiple simulator instances.
 - Simulated alert events are for early integration. Final alert ownership belongs to the Alert Engine.
@@ -758,4 +921,4 @@ Downstream teams own:
 
 Use this summary when handing the simulator to another team:
 
-> The SmartLogix simulator is a PRD-aligned, producer-only Kafka event generator. It creates the required Kafka topics and publishes shipment lifecycle, vehicle telemetry, warehouse activity, simulated alert, and analytics metric events. Downstream backend, data, alerting, fraud, and dashboard services should consume these Kafka topics to implement persistence, ETL, rule processing, APIs, and UI features. The simulator includes local, Docker, and load-test profiles plus health and Prometheus metrics for integration visibility.
+> The SmartLogix simulator is a PRD-aligned Kafka simulator for logistics integration testing. It creates the required Kafka topics, publishes shipment lifecycle, vehicle telemetry, warehouse activity, simulated alert, and analytics metric events, and consumes `simulator-commands` so the logistics backend can inject user-created parcels by `shipmentId`. Downstream backend, data, alerting, fraud, and dashboard services should consume these Kafka topics to implement persistence, ETL, rule processing, APIs, and UI features. The simulator includes local, Docker, and load-test profiles plus health and Prometheus metrics for integration visibility.

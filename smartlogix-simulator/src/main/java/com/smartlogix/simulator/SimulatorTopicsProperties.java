@@ -16,4 +16,6 @@ public class SimulatorTopicsProperties {
     private String alerts = "alerts";
 
     private String analyticsMetrics = "analytics-metrics";
+
+    private String simulatorCommands = "simulator-commands";
 }

@@ -4,6 +4,7 @@ import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import jakarta.annotation.PreDestroy;
+import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -92,6 +93,62 @@ public class LogisticsSimulatorService {
         kafkaTemplate.flush();
     }
 
+    @KafkaListener(topics = "${app.simulator.topics.simulator-commands:simulator-commands}")
+    public void injectDynamicShipment(ShipmentSimulationCommand command) {
+        if (command == null || isBlank(command.getShipmentId())) {
+            log.warn("Ignoring simulator command because shipmentId is missing");
+            return;
+        }
+
+        WarehouseProfile origin;
+        WarehouseProfile destination;
+        try {
+            origin = warehouseById(command.getOriginWarehouseId());
+            destination = warehouseById(command.getDestinationWarehouseId());
+        } catch (IllegalArgumentException ex) {
+            log.warn("Ignoring simulator command for shipment {} because {}", command.getShipmentId(), ex.getMessage());
+            return;
+        }
+
+        if (origin.id().equals(destination.id())) {
+            log.warn("Ignoring simulator command for shipment {} because origin and destination are both {}",
+                    command.getShipmentId(), origin.id());
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        String vehicleId = generateVehicleId();
+        String driverId = generateDriverId();
+
+        ShipmentEvent created = ShipmentEvent.builder()
+                .shipmentId(command.getShipmentId())
+                .eventType(STATE_CREATED)
+                .vehicleId(vehicleId)
+                .driverId(driverId)
+                .originWarehouseId(origin.id())
+                .destinationWarehouseId(destination.id())
+                .currentLat(origin.lat())
+                .currentLng(origin.lng())
+                .plannedEta(plannedEta(now))
+                .temperatureCelsius(normalStartingTemperature())
+                .delayRiskScore(0.05)
+                .timestamp(now)
+                .build();
+
+        ShipmentContext context = new ShipmentContext(created, now, origin, destination, 0.0, false, false, 0);
+        ShipmentContext previous = activeShipments.put(command.getShipmentId(), context);
+        if (previous == null) {
+            incrementWarehouseLoad(origin.id(), 1);
+        }
+        metrics.setActiveShipments(activeShipments.size());
+
+        publish(topics.getShipmentEvents(), command.getShipmentId(), created);
+        publishWarehouseEvent(origin.id(), command.getShipmentId(), vehicleId, EVENT_BARCODE_SCANNED, now);
+
+        log.info("Dynamic shipment {} injected from {} to {} with vehicleId={} driverId={}",
+                command.getShipmentId(), origin.id(), destination.id(), vehicleId, driverId);
+    }
+
     private void tryAddNewShipment(long now) {
         if (activeShipments.size() >= properties.getMaxActiveShipments()) {
             log.debug("Skipping new shipment because active shipment limit {} is reached",
@@ -106,15 +163,8 @@ public class LogisticsSimulatorService {
         WarehouseProfile origin = randomWarehouse();
         WarehouseProfile destination = randomWarehouseExcept(origin.id());
         String shipmentId = "SHP-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase();
-        String vehicleId = "TRK-" + ThreadLocalRandom.current().nextInt(1000, 9999);
-        String driverId = "DRV-" + ThreadLocalRandom.current().nextInt(10000, 99999);
-        long plannedEta = now + properties.getDelaysMs().getLoading()
-                + properties.getDelaysMs().getDriving()
-                + properties.getDelaysMs().getUnloading()
-                + ThreadLocalRandom.current().nextLong(60000, 180000);
-        double temperature = ThreadLocalRandom.current().nextDouble(
-                properties.getColdChain().getMinTemperatureCelsius(),
-                properties.getColdChain().getMaxTemperatureCelsius());
+        String vehicleId = generateVehicleId();
+        String driverId = generateDriverId();
 
         ShipmentEvent created = ShipmentEvent.builder()
                 .shipmentId(shipmentId)
@@ -125,8 +175,8 @@ public class LogisticsSimulatorService {
                 .destinationWarehouseId(destination.id())
                 .currentLat(origin.lat())
                 .currentLng(origin.lng())
-                .plannedEta(plannedEta)
-                .temperatureCelsius(temperature)
+                .plannedEta(plannedEta(now))
+                .temperatureCelsius(normalStartingTemperature())
                 .delayRiskScore(0.05)
                 .timestamp(now)
                 .build();
@@ -413,6 +463,27 @@ public class LogisticsSimulatorService {
                 Math.min(properties.getColdChain().getMaxTemperatureCelsius(), next));
     }
 
+    private double normalStartingTemperature() {
+        return ThreadLocalRandom.current().nextDouble(
+                properties.getColdChain().getMinTemperatureCelsius(),
+                properties.getColdChain().getMaxTemperatureCelsius());
+    }
+
+    private long plannedEta(long now) {
+        return now + properties.getDelaysMs().getLoading()
+                + properties.getDelaysMs().getDriving()
+                + properties.getDelaysMs().getUnloading()
+                + ThreadLocalRandom.current().nextLong(60000, 180000);
+    }
+
+    private String generateVehicleId() {
+        return "TRK-" + ThreadLocalRandom.current().nextInt(1000, 9999);
+    }
+
+    private String generateDriverId() {
+        return "DRV-" + ThreadLocalRandom.current().nextInt(10000, 99999);
+    }
+
     private void incrementWarehouseLoad(String warehouseId, int delta) {
         WarehouseRuntime runtime = warehouseRuntime.get(warehouseId);
         if (runtime != null) {
@@ -458,6 +529,10 @@ public class LogisticsSimulatorService {
             }
         }
         throw new IllegalArgumentException("Unknown warehouse: " + warehouseId);
+    }
+
+    private boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
     }
 
     private double interpolate(double start, double end, double progress) {

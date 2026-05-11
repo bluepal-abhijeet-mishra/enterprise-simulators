@@ -10,6 +10,13 @@ spring:
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
       properties:
         spring.json.add.type.headers: false
+    consumer:
+      group-id: logistics-simulator-group
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "*"
+        spring.json.value.default.type: com.smartlogix.simulator.ShipmentSimulationCommand
 
 server:
   shutdown: graceful
@@ -22,6 +29,7 @@ app:
       warehouse-events: warehouse-events
       alerts: alerts
       analytics-metrics: analytics-metrics
+      simulator-commands: simulator-commands
 
 simulator:
   logistics:

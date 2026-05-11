@@ -62,6 +62,15 @@ public class KafkaTopicConfig {
                 .build();
     }
 
+    @Bean
+    public NewTopic simulatorCommandsTopic() {
+        return TopicBuilder.name(topics.getSimulatorCommands())
+                .partitions(6)
+                .replicas(1)
+                .config("retention.ms", String.valueOf(days(7)))
+                .build();
+    }
+
     private long days(int value) {
         return value * 24L * 60L * 60L * 1000L;
     }
